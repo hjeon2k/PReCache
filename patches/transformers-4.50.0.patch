@@ -1,0 +1,203 @@
+--- a/transformers/cache_utils.py
++++ b/transformers/cache_utils.py
+@@ -597,6 +597,37 @@
+     torch.fx._pytree.register_pytree_flatten_spec(DynamicCache, _flatten_dynamic_cache_for_fx)
+ 
+ 
++class LRCache(Cache):
++    """Per-adapter LR cache X @ A: one [batch, seq_len, rank] tensor per layer."""
++
++    def __init__(self) -> None:
++        super().__init__()
++        self._seen_tokens = 0
++        self.value_cache: List[torch.Tensor] = []
++
++    def __len__(self):
++        return len(self.value_cache)
++
++    def update(self, value_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
++        if layer_idx == 0:
++            self._seen_tokens += value_states.shape[-2]
++        if len(self.value_cache) <= layer_idx:
++            self.value_cache.append(value_states)
++        else:
++            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
++        return self.value_cache[layer_idx]
++
++    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
++        if len(self.value_cache) <= layer_idx:
++            return 0
++        return self.value_cache[layer_idx].shape[-2]
++
++    def crop(self, max_length: int) -> None:
++        for idx in range(len(self.value_cache)):
++            self.value_cache[idx] = self.value_cache[idx][..., :max_length, :]
++        self._seen_tokens = max_length
++
++
+ class OffloadedCache(DynamicCache):
+     """
+     A drop-in replacement for DynamicCache that conserves accelerator(GPU, XPU) memory at the expense of more CPU memory.
+--- a/transformers/integrations/flash_attention.py
++++ b/transformers/integrations/flash_attention.py
+@@ -64,3 +64,64 @@
+     )
+ 
+     return attn_output, None
++
++
++def flash_lora_attention_forward(
++    module: torch.nn.Module,
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    lr_value: torch.Tensor,
++    lr_B: torch.Tensor,
++    attention_mask: Optional[torch.Tensor],
++    scaling: Optional[float] = None,
++    sliding_window: Optional[int] = None,
++    **kwargs,
++) -> Tuple[torch.Tensor, None]:
++    """softmax(QK^T) @ (V_base + lr_value @ lr_B), the LR term inside the kernel; unpadded batches only."""
++    from flash_lora_attn import flash_lora_attn_func
++
++    if attention_mask is not None and (attention_mask == 0).any():
++        raise ValueError("flash_lora_attention does not support padded batches")
++    window = (-1, -1)
++    if sliding_window is not None and key.shape[2] > sliding_window:
++        window = (sliding_window, sliding_window)
++    out = flash_lora_attn_func(
++        query.transpose(1, 2),
++        key.transpose(1, 2),
++        value.transpose(1, 2),
++        lr_value.to(query.dtype),
++        lr_B.to(query.dtype),
++        softmax_scale=scaling,
++        causal=module.is_causal,
++        window_size=window,
++    )
++    return out, None
++
++
++def precache_value(v_proj, hidden_states, past_lr_caches, layer_idx, method, double_batch=False):
++    """Base value X @ W0, the LR cache writes of this pass, and the active agent's LR cache and B^T."""
++    value = v_proj.base_layer(hidden_states)
++    active = v_proj.active_adapters[0]
++    adapters = list(v_proj.lora_A.keys())
++    if double_batch:                        # rebaseshared DB: row 0 adapted, row 1 adapter-free
++        x = hidden_states.to(v_proj.lora_A[active].weight.dtype)
++        past_lr_caches[active].update(v_proj.lora_A[active](x[:1]), layer_idx)
++        for a in adapters:
++            if a != active:
++                past_lr_caches[a].update(v_proj.lora_A[a](x[1:]), layer_idx)
++        lr_value = past_lr_caches[active].value_cache[layer_idx] * v_proj.scaling[active]
++        return value, torch.cat([lr_value, torch.zeros_like(lr_value)]), v_proj.lora_B[active].weight.t()
++    if v_proj.disable_adapters:             # rebaseshared, adapter-free pass
++        writers = [a for a in adapters if a != active]
++    elif method == "prelrshared":
++        writers = adapters
++    else:                                   # rebaseshared, adapted pass
++        writers = [active]
++    x = hidden_states.to(v_proj.lora_A[active].weight.dtype)
++    for a in writers:
++        past_lr_caches[a].update(v_proj.lora_A[a](x), layer_idx)
++    if v_proj.disable_adapters:
++        return value, None, None
++    lr_value = past_lr_caches[active].value_cache[layer_idx] * v_proj.scaling[active]
++    return value, lr_value, v_proj.lora_B[active].weight.t()
+--- a/transformers/models/llama/modeling_llama.py
++++ b/transformers/models/llama/modeling_llama.py
+@@ -28,6 +28,7 @@
+ from ...generation import GenerationMixin
+ from ...modeling_attn_mask_utils import AttentionMaskConverter
+ from ...modeling_flash_attention_utils import FlashAttentionKwargs
++from ...integrations.flash_attention import flash_lora_attention_forward, precache_value
+ from ...modeling_outputs import (
+     BaseModelOutputWithPast,
+     CausalLMOutputWithPast,
+@@ -273,10 +274,19 @@
+     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+         input_shape = hidden_states.shape[:-1]
+         hidden_shape = (*input_shape, -1, self.head_dim)
++        past_lr_caches = kwargs.pop("past_lr_caches", None)
++        double_batch = kwargs.pop("precache_double_batch", False)
+ 
+         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++        lr_value_states = None
++        if past_lr_caches is None:
++            value_states = self.v_proj(hidden_states)
++        else:
++            value_states, lr_value_states, lr_B = precache_value(
++                self.v_proj, hidden_states, past_lr_caches, self.layer_idx, self.config.precache_method, double_batch
++            )
++        value_states = value_states.view(hidden_shape).transpose(1, 2)
+ 
+         cos, sin = position_embeddings
+         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+@@ -286,6 +296,16 @@
+             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+ 
++        if lr_value_states is not None:
++            lr_B = lr_B.view(lr_B.shape[0], -1, self.head_dim).transpose(0, 1)
++            attn_output, attn_weights = flash_lora_attention_forward(
++                self, query_states, key_states, value_states, lr_value_states, lr_B, attention_mask,
++                scaling=self.scaling,
++            )
++            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
++            attn_output = self.o_proj(attn_output)
++            return attn_output, attn_weights
++
+         attention_interface: Callable = eager_attention_forward
+         if self.config._attn_implementation != "eager":
+             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+--- a/transformers/models/mistral/modeling_mistral.py
++++ b/transformers/models/mistral/modeling_mistral.py
+@@ -14,6 +14,7 @@
+ from ...generation import GenerationMixin
+ from ...modeling_attn_mask_utils import AttentionMaskConverter
+ from ...modeling_flash_attention_utils import FlashAttentionKwargs
++from ...integrations.flash_attention import flash_lora_attention_forward, precache_value
+ from ...modeling_outputs import (
+     BaseModelOutputWithPast,
+     CausalLMOutputWithPast,
+@@ -158,10 +159,19 @@
+     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+         input_shape = hidden_states.shape[:-1]
+         hidden_shape = (*input_shape, -1, self.head_dim)
++        past_lr_caches = kwargs.pop("past_lr_caches", None)
++        double_batch = kwargs.pop("precache_double_batch", False)
+ 
+         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++        lr_value_states = None
++        if past_lr_caches is None:
++            value_states = self.v_proj(hidden_states)
++        else:
++            value_states, lr_value_states, lr_B = precache_value(
++                self.v_proj, hidden_states, past_lr_caches, self.layer_idx, self.config.precache_method, double_batch
++            )
++        value_states = value_states.view(hidden_shape).transpose(1, 2)
+ 
+         cos, sin = position_embeddings
+         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+@@ -171,6 +181,16 @@
+             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+ 
++        if lr_value_states is not None:
++            lr_B = lr_B.view(lr_B.shape[0], -1, self.head_dim).transpose(0, 1)
++            attn_output, attn_weights = flash_lora_attention_forward(
++                self, query_states, key_states, value_states, lr_value_states, lr_B, attention_mask,
++                scaling=self.scaling, sliding_window=getattr(self.config, "sliding_window", None),
++            )
++            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
++            attn_output = self.o_proj(attn_output)
++            return attn_output, attn_weights
++
+         attention_interface: Callable = eager_attention_forward
+         if self.config._attn_implementation != "eager":
+             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):

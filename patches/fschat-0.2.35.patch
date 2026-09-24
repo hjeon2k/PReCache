@@ -1,0 +1,151 @@
+--- a/fastchat/model/model_adapter.py
++++ b/fastchat/model/model_adapter.py
+@@ -49,6 +49,18 @@
+     os.environ.get("PEFT_SHARE_BASE_WEIGHTS", "false").lower() == "true"
+ )
+ 
++# PReCache KV cache sharing across LoRA agents: "prelrshared", "rebaseshared", or unset (NonShared)
++precache_method = os.environ.get("PRECACHE_METHOD") or None
++if precache_method not in (None, "prelrshared", "rebaseshared"):
++    raise ValueError(f"unknown PRECACHE_METHOD {precache_method!r}")
++
++
++def precache_reset(model):
++    """New trajectory: shared base KV cache, one LR cache per agent, and the token ids they hold."""
++    from transformers.cache_utils import DynamicCache, LRCache
++
++    model.precache = (DynamicCache(), {name: LRCache() for name in model.peft_config}, [])
++
+ ANTHROPIC_MODEL_LIST = (
+     "claude-1",
+     "claude-2",
+@@ -627,6 +639,9 @@
+                 # `adapter_name`.
+                 model.load_adapter(model_path, adapter_name=model_path)
+             else:
++                if precache_method:
++                    # FLA and the adapter-free pass run on flash kernels
++                    from_pretrained_kwargs["attn_implementation"] = "flash_attention_2"
+                 base_adapter = get_model_adapter(base_model_path)
+                 base_model, tokenizer = base_adapter.load_model(
+                     base_model_path, from_pretrained_kwargs
+@@ -637,6 +652,12 @@
+                     base_model, model_path, adapter_name=model_path
+                 )
+                 peft_model_cache[base_model_path] = (model, tokenizer)
++            if precache_method:
++                targets = set(model.peft_config[model_path].target_modules)
++                if "v_proj" not in targets or "k_proj" in targets:
++                    raise ValueError(f"PReCache expects LoRA on v_proj and not k_proj, got {targets}")
++                model.config.precache_method = precache_method
++                precache_reset(model)
+             return model, tokenizer
+ 
+         # In the normal case, load up the base model weights again.
+--- a/fastchat/serve/inference.py
++++ b/fastchat/serve/inference.py
+@@ -91,6 +91,29 @@
+     )
+     input_ids = tokenizer(prompt).input_ids
+ 
++    # PReCache: the shared cache persists between calls; only tokens past it are fed
++    precache = getattr(model, "precache", None)
++    lr_kw = {}
++    if precache is not None:
++        past_key_values, past_lr_caches, cached_ids = precache
++        # reuse the cache only as far as the prompt agrees with the tokens it holds
++        common = 0
++        for a, b in zip(cached_ids, input_ids[:-1]):
++            if a != b:
++                break
++            common += 1
++        if common < len(cached_ids):
++            past_key_values.crop(common)
++            for cache in past_lr_caches.values():
++                if cache.get_seq_length() > common:
++                    cache.crop(common)
++            del cached_ids[common:]
++        prompt_ids = input_ids
++        start = past_lr_caches[model.active_adapter].get_seq_length()
++        assert start == past_key_values.get_seq_length(), "LR cache out of step with the KV cache"
++        input_ids = input_ids[start:]
++        lr_kw = {"past_lr_caches": past_lr_caches}
++
+     if model.config.is_encoder_decoder:
+         max_src_len = context_len
+     else:  # truncate
+@@ -114,7 +137,9 @@
+     else:
+         start_ids = torch.as_tensor([input_ids], device=device)
+ 
+-    past_key_values = out = None
++    if precache is None:
++        past_key_values = None
++    out = None
+     token_logprobs = [None]  # The first token has no logprobs.
+     sent_interrupt = False
+     finish_reason = None
+@@ -129,7 +154,12 @@
+                 )
+                 logits = model.lm_head(out[0])
+             else:
+-                out = model(input_ids=start_ids, use_cache=True)
++                if precache is not None:
++                    positions = torch.arange(start, start + start_ids.shape[1], device=device)
++                    out = model(input_ids=start_ids, use_cache=True, past_key_values=past_key_values,
++                                cache_position=positions, **lr_kw)
++                else:
++                    out = model(input_ids=start_ids, use_cache=True)
+                 logits = out.logits
+             past_key_values = out.past_key_values
+ 
+@@ -164,6 +194,7 @@
+                     ),
+                     use_cache=True,
+                     past_key_values=past_key_values if not sent_interrupt else None,
++                    **lr_kw,
+                 )
+                 sent_interrupt = False
+                 logits = out.logits
+@@ -306,6 +337,22 @@
+         "finish_reason": finish_reason,
+     }
+ 
++    # ReBaseShared lazy prefill: re-forward this turn's fed tokens without adapters
++    if precache is not None and model.config.precache_method == "rebaseshared":
++        turn_ids = output_ids[:-1]
++        past_key_values.crop(start)
++        with model.disable_adapter():
++            model(
++                input_ids=torch.as_tensor([turn_ids], device=device),
++                use_cache=True,
++                past_key_values=past_key_values,
++                cache_position=torch.arange(start, start + len(turn_ids), device=device),
++                logits_to_keep=1,
++                **lr_kw,
++            )
++    if precache is not None:
++        cached_ids[:] = prompt_ids[:start] + output_ids[:-1]
++
+     # Clean
+     del past_key_values, out
+     gc.collect()
+--- a/fastchat/serve/multi_model_worker.py
++++ b/fastchat/serve/multi_model_worker.py
+@@ -124,6 +124,16 @@
+     return JSONResponse(content=embedding, background=background_tasks)
+ 
+ 
++@app.post("/precache_reset")
++async def api_precache_reset(request: Request):
++    from fastchat.model.model_adapter import precache_method, precache_reset
++
++    if precache_method:      # NonShared keeps no cache between calls
++        for model in {id(w.model): w.model for w in workers}.values():
++            precache_reset(model)
++    return {"ok": True}
++
++
+ @app.post("/worker_get_status")
+ async def api_get_status(request: Request):
+     return {

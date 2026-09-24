@@ -1,0 +1,14 @@
+# torch 2.6.0 (cu124) and flash-attn 2.7.4.post1 are installed by scripts/install.sh
+transformers==4.50.0
+peft==0.15.0
+accelerate==1.6.0
+fschat[model_worker]==0.2.35
+langchain==0.0.299
+openai==0.28.0
+wikipedia==1.4.0
+einops
+tiktoken
+joblib==1.4.2
+pandas==1.5.3
+numpy==1.26.4
+requests
